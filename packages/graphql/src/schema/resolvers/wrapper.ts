@@ -28,22 +28,17 @@ import { getToken } from "../../utils/get-token";
 
 const debug = Debug(DEBUG_GRAPHQL);
 
+type WrapResolverArguments = {
+    driver?: Driver;
+    config: Neo4jGraphQLConfig;
+    nodes: Node[];
+    relationships: Relationship[];
+    schema: GraphQLSchema;
+    plugins?: Neo4jGraphQLPlugins;
+};
+
 export const wrapResolver =
-    ({
-        driver,
-        config,
-        nodes,
-        relationships,
-        schema,
-        plugins,
-    }: {
-        driver?: Driver;
-        config: Neo4jGraphQLConfig;
-        nodes: Node[];
-        relationships: Relationship[];
-        schema: GraphQLSchema;
-        plugins?: Neo4jGraphQLPlugins;
-    }) =>
+    ({ driver, config, nodes, relationships, schema, plugins }: WrapResolverArguments) =>
     (next) =>
     async (root, args, context: Context, info: GraphQLResolveInfo) => {
         const { driverConfig } = config;
@@ -57,13 +52,17 @@ export const wrapResolver =
             );
         }
 
-        if (!context?.driver) {
-            if (!driver) {
-                throw new Error(
-                    "A Neo4j driver instance must either be passed to Neo4jGraphQL on construction, or passed as context.driver in each request."
-                );
+        if (!context?.executionContext) {
+            if (context?.driver) {
+                context.executionContext = context.driver;
+            } else {
+                if (!driver) {
+                    throw new Error(
+                        "A Neo4j driver instance must either be passed to Neo4jGraphQL on construction, or a driver, session or transaction passed as context.executionContext in each request."
+                    );
+                }
+                context.executionContext = driver;
             }
-            context.driver = driver;
         }
 
         if (!context?.driverConfig) {
@@ -75,6 +74,7 @@ export const wrapResolver =
         context.schema = schema;
         context.plugins = plugins;
         context.subscriptionsEnabled = Boolean(context.plugins?.subscriptions);
+        context.callbacks = config.callbacks;
 
         if (!context.jwt) {
             if (context.plugins?.auth) {
@@ -97,4 +97,18 @@ export const wrapResolver =
         context.queryOptions = config.queryOptions;
 
         return next(root, args, context, info);
+    };
+
+export const wrapSubscription =
+    (resolverArgs: WrapResolverArguments) =>
+    (next) =>
+    (root, args, context: Record<string, any>, info: GraphQLResolveInfo) => {
+        // TODO: context auth
+        let subscriptionContext = {};
+        if (resolverArgs.plugins?.subscriptions) {
+            subscriptionContext = {
+                plugin: resolverArgs.plugins.subscriptions,
+            };
+        }
+        return next(root, args, { ...context, ...subscriptionContext }, info);
     };

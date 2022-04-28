@@ -25,7 +25,7 @@ import filterInterfaceNodes from "../utils/filter-interface-nodes";
 import createConnectionAndParams from "./connection/create-connection-and-params";
 import createAuthAndParams from "./create-auth-and-params";
 import createProjectionAndParams from "./create-projection-and-params";
-import { getRelationshipDirection } from "./cypher-builder/get-relationship-direction";
+import { getRelationshipDirection } from "../utils/get-relationship-direction";
 import createElementWhereAndParams from "./where/create-element-where-and-params";
 
 function createInterfaceProjectionAndParams({
@@ -184,6 +184,7 @@ function createInterfaceProjectionAndParams({
         }
 
         if (recurse[2]?.interfaceFields?.length) {
+            const prevRelationshipFields: string[] = [];
             recurse[2].interfaceFields.forEach((interfaceResolveTree) => {
                 const relationshipField = refNode.relationFields.find(
                     (x) => x.fieldName === interfaceResolveTree.name
@@ -193,7 +194,9 @@ function createInterfaceProjectionAndParams({
                     field: relationshipField,
                     context,
                     nodeVariable: param,
+                    withVars: prevRelationshipFields,
                 });
+                prevRelationshipFields.push(relationshipField.dbPropertyName || relationshipField.fieldName);
                 subquery.push(interfaceProjection.cypher);
                 params = { ...params, ...interfaceProjection.params };
             });

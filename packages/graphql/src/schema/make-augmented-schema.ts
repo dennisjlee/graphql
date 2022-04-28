@@ -29,10 +29,10 @@ import {
     parse,
     print,
 } from "graphql";
-import { InputTypeComposer, ObjectTypeComposer, SchemaComposer } from "graphql-compose";
+import { ObjectTypeComposer, SchemaComposer } from "graphql-compose";
 import pluralize from "pluralize";
 import { validateDocument } from "./validation";
-import { BaseField, PrimitiveField } from "../types";
+import { BaseField, Neo4jGraphQLCallbacks } from "../types";
 import {
     aggregateResolver,
     createResolver,
@@ -41,6 +41,7 @@ import {
     findResolver,
     updateResolver,
     numericalResolver,
+    rootConnectionResolver,
 } from "./resolvers";
 import { AggregationTypesMapper } from "./aggregations/aggregation-types-mapper";
 import * as constants from "../constants";
@@ -60,8 +61,8 @@ import {
 } from "./to-compose";
 import getUniqueFields from "./get-unique-fields";
 import getWhereFields from "./get-where-fields";
-import { isString } from "../utils/utils";
 import { upperFirst } from "../utils/upper-first";
+import { ensureNonEmptyInput } from "./ensureNonEmptyInput";
 import { getDocument } from "./get-document";
 import { getDefinitionNodes } from "./get-definition-nodes";
 import { isRootType } from "../utils/is-root-type";
@@ -81,6 +82,7 @@ import { PointDistance } from "./types/input-objects/PointDistance";
 import { CartesianPointDistance } from "./types/input-objects/CartesianPointDistance";
 import getNodes from "./get-nodes";
 import { generateSubscriptionTypes } from "./subscriptions/generate-subscription-types";
+import { getResolveAndSubscriptionMethods } from "./get-resolve-and-subscription-methods";
 
 function makeAugmentedSchema(
     typeDefs: TypeSource,
@@ -88,7 +90,13 @@ function makeAugmentedSchema(
         enableRegex,
         skipValidateTypeDefs,
         generateSubscriptions,
-    }: { enableRegex?: boolean; skipValidateTypeDefs?: boolean; generateSubscriptions?: boolean } = {}
+        callbacks,
+    }: {
+        enableRegex?: boolean;
+        skipValidateTypeDefs?: boolean;
+        generateSubscriptions?: boolean;
+        callbacks?: Neo4jGraphQLCallbacks;
+    } = {}
 ): { nodes: Node[]; relationships: Relationship[]; typeDefs: DocumentNode; resolvers: IResolvers } {
     const document = getDocument(typeDefs);
 
@@ -136,7 +144,7 @@ function makeAugmentedSchema(
         composer.addTypeDefs(print({ kind: Kind.DOCUMENT, definitions: extraDefinitions }));
     }
 
-    const getNodesResult = getNodes(definitionNodes);
+    const getNodesResult = getNodes(definitionNodes, { callbacks });
 
     const { nodes, relationshipPropertyInterfaceNames, interfaceRelationshipNames } = getNodesResult;
 
@@ -183,6 +191,7 @@ function makeAugmentedSchema(
             scalars: scalarTypes,
             unions: unionTypes,
             obj: relationship,
+            callbacks,
         });
 
         if (!pointInTypeDefs) {
@@ -213,7 +222,9 @@ function makeAugmentedSchema(
         composer.createInputTC({
             name: `${relationship.name.value}UpdateInput`,
             fields: objectFieldsToUpdateInputFields([
-                ...relFields.primitiveFields.filter((field) => !field.autogenerate && !field.readonly),
+                ...relFields.primitiveFields.filter(
+                    (field) => !field.autogenerate && !field.readonly && !field.callback
+                ),
                 ...relFields.scalarFields,
                 ...relFields.enumFields,
                 ...relFields.temporalFields.filter((field) => !field.timestamps),
@@ -241,30 +252,14 @@ function makeAugmentedSchema(
         composer.createInputTC({
             name: `${relationship.name.value}CreateInput`,
             fields: objectFieldsToCreateInputFields([
-                ...relFields.primitiveFields.filter((field) => !field.autogenerate),
+                ...relFields.primitiveFields.filter((field) => !field.autogenerate && !field.callback),
                 ...relFields.scalarFields,
                 ...relFields.enumFields,
-                ...relFields.temporalFields.filter((field) => !field.timestamps),
+                ...relFields.temporalFields,
                 ...relFields.pointFields,
             ]),
         });
     });
-
-    function ensureNonEmptyInput(nameOrInput: string | InputTypeComposer<any>) {
-        const input = isString(nameOrInput) ? composer.getITC(nameOrInput) : nameOrInput;
-
-        if (input.getFieldNames().length === 0) {
-            const faqURL = `https://neo4j.com/docs/graphql-manual/current/troubleshooting/faqs/`;
-            input.addFields({
-                _emptyInput: {
-                    type: "Boolean",
-                    description:
-                        `Appears because this input type would be empty otherwise because this type is ` +
-                        `composed of just generated and/or relationship properties. See ${faqURL}`,
-                },
-            });
-        }
-    }
 
     interfaceRelationships.forEach((interfaceRelationship) => {
         const implementations = objectTypes.filter((n) =>
@@ -278,6 +273,7 @@ function makeAugmentedSchema(
             scalars: scalarTypes,
             unions: unionTypes,
             obj: interfaceRelationship,
+            callbacks,
         });
 
         if (!pointInTypeDefs) {
@@ -470,15 +466,15 @@ function makeAugmentedSchema(
             interfaceDisconnectInput.setField("_on", implementationsDisconnectInput);
         }
 
-        ensureNonEmptyInput(`${interfaceRelationship.name.value}CreateInput`);
-        ensureNonEmptyInput(`${interfaceRelationship.name.value}UpdateInput`);
+        ensureNonEmptyInput(composer, `${interfaceRelationship.name.value}CreateInput`);
+        ensureNonEmptyInput(composer, `${interfaceRelationship.name.value}UpdateInput`);
         [
             implementationsConnectInput,
             implementationsDeleteInput,
             implementationsDisconnectInput,
             implementationsUpdateInput,
             implementationsWhereInput,
-        ].forEach((c) => ensureNonEmptyInput(c));
+        ].forEach((c) => ensureNonEmptyInput(composer, c));
     });
 
     if (pointInTypeDefs) {
@@ -588,7 +584,7 @@ function makeAugmentedSchema(
         };
 
         composer.createObjectTC({
-            name: `${node.name}AggregateSelection`,
+            name: node.aggregateTypeNames.selection,
             fields: {
                 count: countField,
                 ...[...node.primitiveFields, ...node.temporalFields].reduce((res, field) => {
@@ -622,7 +618,6 @@ function makeAugmentedSchema(
                         name: `${node.name}${upperFirst(index.name)}Fulltext`,
                         fields: {
                             phrase: "String!",
-                            score_EQUAL: "Int",
                         },
                     }),
                 }),
@@ -644,21 +639,19 @@ function makeAugmentedSchema(
 
         composer.createInputTC({
             name: `${node.name}CreateInput`,
-            fields: objectFieldsToCreateInputFields(
-                [
-                    ...node.primitiveFields,
-                    ...node.scalarFields,
-                    ...node.enumFields,
-                    ...node.temporalFields.filter((field) => !field.timestamps),
-                    ...node.pointFields,
-                ].filter((f) => !(f as PrimitiveField)?.autogenerate)
-            ),
+            fields: objectFieldsToCreateInputFields([
+                ...node.primitiveFields.filter((field) => !field.callback),
+                ...node.scalarFields,
+                ...node.enumFields,
+                ...node.temporalFields,
+                ...node.pointFields,
+            ]),
         });
 
         composer.createInputTC({
             name: `${node.name}UpdateInput`,
             fields: objectFieldsToUpdateInputFields([
-                ...node.primitiveFields,
+                ...node.primitiveFields.filter((field) => !field.callback),
                 ...node.scalarFields,
                 ...node.enumFields,
                 ...node.temporalFields.filter((field) => !field.timestamps),
@@ -704,8 +697,8 @@ function makeAugmentedSchema(
             }),
         ];
 
-        ensureNonEmptyInput(`${node.name}UpdateInput`);
-        ensureNonEmptyInput(`${node.name}CreateInput`);
+        ensureNonEmptyInput(composer, `${node.name}UpdateInput`);
+        ensureNonEmptyInput(composer, `${node.name}CreateInput`);
 
         const rootTypeFieldNames = node.rootTypeFieldNames;
 
@@ -716,6 +709,10 @@ function makeAugmentedSchema(
 
             composer.Query.addFields({
                 [rootTypeFieldNames.aggregate]: aggregateResolver({ node }),
+            });
+
+            composer.Query.addFields({
+                [`${node.plural}Connection`]: rootConnectionResolver({ node, composer }),
             });
         }
 
@@ -757,6 +754,7 @@ function makeAugmentedSchema(
                 interfaces: interfaceTypes,
                 unions: unionTypes,
                 objects: objectTypes,
+                callbacks,
             });
 
             const objectComposeFields = objectFieldsToComposeFields([
@@ -794,6 +792,7 @@ function makeAugmentedSchema(
             interfaces: interfaceTypes,
             unions: unionTypes,
             objects: objectTypes,
+            callbacks,
         });
 
         const baseFields: BaseField[][] = Object.values(objectFields);
@@ -836,8 +835,9 @@ function makeAugmentedSchema(
 
     const documentNames = parsedDoc.definitions.filter(definionNodeHasName).map((x) => x.name.value);
 
+    const resolveMethods = getResolveAndSubscriptionMethods(composer);
     const generatedResolvers = {
-        ...Object.entries(composer.getResolveMethods()).reduce((res, [key, value]) => {
+        ...Object.entries(resolveMethods).reduce((res, [key, value]) => {
             if (!documentNames.includes(key)) {
                 return res;
             }
